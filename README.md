@@ -3,7 +3,7 @@
 
 RacerOS is the Arduino-compatible code that runs inside the ATMega32U4 MCU inside each 3DRacers
 
-![Alt text](/photos/shell-help.jpg?raw=true "3DRacers RacerOS screen")
+![Alt text](/photos/shell-help.png?raw=true "3DRacers RacerOS screen")
 
 ## The Game
 
@@ -41,7 +41,7 @@ You can connect to the RacersOS console by plugging the car by USB and opening t
 
 If you open the console in the first 5 seconds you'll see the Welcome screen with some usefull debug info:
 
-![Alt text](/photos/shell-welcome.jpg?raw=true "3DRacers welcome screen")
+![Alt text](/photos/shell-welcome.png?raw=true "3DRacers welcome screen")
 
 You can also issue some commands:
 
