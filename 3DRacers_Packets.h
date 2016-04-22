@@ -3,14 +3,17 @@
 #define CONFIG_CMD_ID 1
 #define ACK_CMD_ID 2
 #define NAME_CMD_ID 3
+#define IDENTITY_CMD_ID 4
 
-//NB: avr-gcc on Atmega32u4 seems to use already a 1byte alignment for structs, however to be sure we'll set the packed attribute here.
+
+//NB: avr-gcc on Atmega32u4 seems to use already a 1byte alignment for structs, however to be sure we'll set the ((packed)) attribute on each struct.
 
 //15bytes
 struct __attribute__ ((packed)) DriveCommand 
 {
 	char id;
-	unsigned long packetCount;
+	unsigned int packetCount;
+	byte crc;
 	
 	short throttle;//From 0 to 1024 //2B
 	short steerAngle;//From -90 to 90 //2B
@@ -26,6 +29,7 @@ struct __attribute__ ((packed)) DriveCommand
 	{
 		id = DRIVE_CMD_ID;
 		packetCount = 0;
+		crc = 0x00;
 		throttle = 0;
 		steerAngle = 45;
 		brake = false;
@@ -39,23 +43,27 @@ struct __attribute__ ((packed)) DriveCommand
 };
 typedef struct DriveCommand DriveCommand;
 
-//13bytes
+//17bytes
 struct __attribute__ ((packed)) AckCommand
 {
 	char id;
-	unsigned long packetCount;
+	unsigned int packetCount;
+	byte crc;
 	
 	short batteryLevel;
 	short sensorLevel;
-	unsigned long lastGateDetected; //NB: it seems that there are some problems with unsigned longs in c#
+	unsigned long lastGateDetected;
+	unsigned long lastGateDuration;
 	
 	AckCommand()
 	{
 		id = ACK_CMD_ID;
 		packetCount = 0;
+		crc = 0x00;
 		batteryLevel = 0;
 		sensorLevel = 0;
 		lastGateDetected = 0;
+		lastGateDuration = 0;
 	}
 	
 };
@@ -77,12 +85,13 @@ typedef union {
         byte raw;
 } flags_cfg;
 
-//10bytes
+//8bytes
 struct __attribute__ ((packed)) ConfigCommand
 {
 
 	char id;
-	unsigned long packetCount;
+	unsigned int packetCount;
+	byte crc;
 	
 	byte version;
 	byte minorVersion;
@@ -92,21 +101,24 @@ struct __attribute__ ((packed)) ConfigCommand
 	
 	short steerCenter; //2B
 	short steerMax; //2B
-
+	short sensorThreshold; //2B
 	
 	ConfigCommand()
 	{
 		id = CONFIG_CMD_ID;
 		packetCount = 0;
+		crc = 0x00;
 		
 		steerCenter = 90;
 		steerMax = 10;
+		sensorThreshold = 900;
+		
 		flags.steerCenterChanged = false;
 		flags.steerMaxChanged = false;
 		version = 0;
 		minorVersion = 0;
 		protocolVersion = 0;
-		flags.enableGateSensor = false;
+		flags.enableGateSensor = true;
 		flags.gateSensorDebug = false;
 		flags.calibrated = false;
 		flags.invertSteering = false;
@@ -120,7 +132,8 @@ struct __attribute__ ((packed)) NameCommand
 {
 
 	char id;
-	unsigned long packetCount;
+	unsigned int packetCount;
+	byte crc;
 	
 	char name[12]; 
 	
@@ -128,7 +141,33 @@ struct __attribute__ ((packed)) NameCommand
 	{
 		id = NAME_CMD_ID;
 		packetCount = 0;
+		crc = 0x00;
 	}
 
 };
 typedef struct NameCommand NameCommand;
+
+//With this msgpart this command request/contains the SHA signature id
+#define IDENTITY_GET_SIGNATURE_MSG_PART 10
+
+struct __attribute__ ((packed)) IdentityCommand
+{
+
+	char id;
+	unsigned int packetCount;
+	byte crc;
+	
+	byte msgPart;
+	
+	char payload[12]; 
+	
+	IdentityCommand()
+	{
+		id = IDENTITY_CMD_ID;
+		packetCount = 0;
+		crc = 0x00;
+		msgPart = 0;
+	}
+
+};
+typedef struct IdentityCommand IdentityCommand;

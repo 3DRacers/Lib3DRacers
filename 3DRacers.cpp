@@ -1,17 +1,10 @@
 #ifndef THREEDRACERS_C
 #define THREEDRACERS_C
 
-////////
-//
-//Written by Marco D'Alia and Davide Marcoccio
-//2015
-//
-//
-////////
-
 #include "3DRacers.h"
 #include "Config.h"
 #include "BleHM10Driver.h"
+#include "IRSensor.h"
 
 //------------------------
 #include <Arduino.h>
@@ -20,7 +13,9 @@
 #include <Servo.h>
 #include <Adafruit_NeoPixel.h>
 #include <EEPROMAnything.h>
-#include <SoftPWM.h>
+
+#include <sha204_library.h>
+#include <sha204_includes/sha204_lib_return_codes.h>
 
 ThreeDRacers::ThreeDRacers() :
 	//Static fields
@@ -30,8 +25,6 @@ ThreeDRacers::ThreeDRacers() :
 	EEPROM_INVERT_STEERING(32),
 	EEPROM_INVERT_THROTTLE(40),
 	connectionLedLoop(0),
-	gatePower(60),
-	gateMinDelay(1 * 1000),//10s
 	//non-static fields
 	packetCount(0),
 	lastPacketCount(0),
@@ -41,9 +34,15 @@ ThreeDRacers::ThreeDRacers() :
 	servoPin(SERVO_PIN),
 	sensorPin(SENSOR_PIN),
 	
+	identity(IDENTITY_PIN),
+	
+	tickCount(0),
+	
 	ledPin(LED_PIN),
+	#if !REDUCED_FEATURES
 	ledStrip(1, LED_PIN, NEO_GRB + NEO_KHZ800),
-
+	#endif
+	
 	BleSerial(NULL),
 	Serial(NULL),
 
@@ -54,7 +53,14 @@ ThreeDRacers::ThreeDRacers() :
 	wasConnected(false),
 	
 	input(),
-	wireless()
+	wireless(),
+	sensor(),
+	
+	processConnectCommand(NULL),
+	processDriveCommand(NULL),
+	processConfigCommand(NULL),
+	processOnGateDetected(NULL),
+	processRaw1Command(NULL)
 
 {
 }
@@ -70,23 +76,43 @@ void ThreeDRacers::Begin(HardwareSerial &bleSerial, Serial_ &serial)
 	configCmd.version = VERSION;
 	configCmd.minorVersion = MINOR_VERSION;
 	configCmd.protocolVersion = PROTOCOL_VERSION;
-
+				
+	//Chainable led:
+	#if !REDUCED_FEATURES
+	ledStrip.begin();
+	LedColor(255, 255, 0);
+	#endif
+	
+	#if SHELL_ENABLED && STARTUP_LOG
+	//Place a finger on the sensor to wait for the startup sequence to start (giving time to connecto to the Arduino console)
+	pinMode(SENSOR_LED_PIN, OUTPUT);
+	digitalWrite(SENSOR_LED_PIN, LOW);
+	delay(100);
+	if(analogRead(SENSOR_PIN) < 600) {
+		delay(10000); //Give time to open the serial console
+	}
+	#endif
+	
 	#if SHELL_ENABLED || SERIAL_DEBUG || SERIAL_DEBUG_NET
 		while (!Serial) {
 			; // wait for serial port to connect. Needed for Leonardo only
 		}
-		delay(5000); //Give time to open the serial console
+		
 		//430bytes:
-		#if !SERIAL_DEBUG_NET
+		#if !SERIAL_DEBUG_NET && STARTUP_LOG
 		STARTLOGFln("  ____  _____  _____");       
 		STARTLOGFln(" |___ \\|  __ \\|  __ \\");
 		STARTLOGFln("   __) | |  | | |__) |__ _  ___ ___ _ __ ___");
 		STARTLOGFln("  |__ <| |  | |  _  // _` |/ __/ _ \\ '__/ __|");
 		STARTLOGFln("  ___) | |__| | | \\ \\ (_| | (_|  __/ |  \\__ \\");
 		STARTLOGFln(" |____/|_____/|_|  \\_\\__,_|\\___\\___|_|  |___/");
-		STARTLOGF  ("               RacerOS v");
-		STARTLOGln(VERSION);
-		STARTLOGFln("");
+		STARTLOGF  ("            RacerOS v");
+		STARTLOG(VERSION);
+		STARTLOGF(".");
+		STARTLOG(MINOR_VERSION);
+		STARTLOGF(" (net: ");
+		STARTLOG(PROTOCOL_VERSION);
+		STARTLOGFln(")");
 		STARTLOGFln("Initializing...");
 		#endif
 	#endif
@@ -104,18 +130,18 @@ void ThreeDRacers::Begin(HardwareSerial &bleSerial, Serial_ &serial)
 	delay(10);
 	STARTLOGFln(" [OK]");
 	
-	//Chainable RGB Led
-	STARTLOGF("[CAR] RGB Led setup");	
-	ledStrip.begin();
-	LedColor(255, 255, 0);
-	STARTLOGFln(" [OK]");
-	
 	//Init BLE radio:
 	wireless.begin(*BleSerial, *Serial, BLE_RESET);
+	if(wireless.isUpdating) {
+		//Go in BLE update mode and interrupt the init process:
+		LedColor(255, 0, 255);
+		return;
+	}
+	
 	nextConnectionCheck = millis();
 	
 	//Motor init:
-	STARTLOGF("[CAR] DC Motor1 setup");	
+	STARTLOGF("[CAR] DC MotorA setup");	
 	motorSetup();
 
 	//Welcome sequence:
@@ -129,7 +155,7 @@ void ThreeDRacers::Begin(HardwareSerial &bleSerial, Serial_ &serial)
 	STARTLOGFln(" [OK]");
 	
 	//Servo init:
-	STARTLOGF("[CAR] Load config from EEPROM");
+	STARTLOGF("[CAR] Load EEPROM");
 	if (EEPROM.read(EEPROM_SERVO_CENTER) != 255) {
 		EEPROM_readAnything(EEPROM_SERVO_CENTER, configCmd.steerCenter);
 	}
@@ -155,7 +181,7 @@ void ThreeDRacers::Begin(HardwareSerial &bleSerial, Serial_ &serial)
 	
 	//Attach Servo
 	STARTLOGF("[CAR] Servo setup");	
-	STARTLOGF(" using Interrupt: ");	
+	STARTLOGF(" int.: ");	
 	#ifdef _useTimer1
 		STARTLOGF("1 ");
 	#endif
@@ -186,7 +212,7 @@ void ThreeDRacers::Begin(HardwareSerial &bleSerial, Serial_ &serial)
 	STARTLOGFln(" [OK]");
 	
 	#if SHELL_ENABLED
-	SHELLOUTFln("[CAR] Ready for connection or console commands (eg: /help) [OK]");
+	SHELLOUTFln("[CAR] Ready (eg: /help) [OK]");
 	SHELLOUTFln("");
 	SHELLOUTFln(":>");
 	#endif
@@ -194,19 +220,56 @@ void ThreeDRacers::Begin(HardwareSerial &bleSerial, Serial_ &serial)
 
 void ThreeDRacers::Process()
 {
-
 	//Started the update routine of the BLE module, 
 	//just act as a Serial proxy and be silent to not corrupt data:
 	if(wireless.isUpdating) {
-	  if (BleSerial->available())
-		Serial->write(BleSerial->read());
 	  if (Serial->available())
 		BleSerial->write(Serial->read());
+	  if (BleSerial->available())
+		Serial->write(BleSerial->read());
 		
 	  return; //Quit to not corrupt data
 	}
+	
+	tickCount++;
+	
+	//process IR reflective sensor gates detection:
+	ackCmd.sensorLevel = (short) analogRead(sensorPin);
+	if(sensor.process(ackCmd.sensorLevel)) {
+		SHELLOUTFln("[CAR] Gate detected ");				
+		ackCmd.lastGateDetected = sensor.lastSequenceStart;
+		ackCmd.lastGateDuration = sensor.lastSequenceDuration;
+		if(processOnGateDetected != NULL) processOnGateDetected(ackCmd, carInfo);
+		SendAckNotification();
+	}
+	else {
+		ackCmd.lastGateDetected = 0;
+		ackCmd.lastGateDuration = 0;
+	}
+	
+	//Process the other parts only 1 out of 10 times:
+	if(tickCount % 10 != 0) {
+		return;
+	}
 
 	//Read incoming data (if any):
+	processPackets();
+		
+	//check connection status
+	if (nextConnectionCheck < millis())
+	{
+		ConnectionStatus();
+		ackCmd.batteryLevel = readVcc();
+		nextConnectionCheck = millis() + CONNECTION_CHECK_RATE;
+	}
+
+	//Serial commands:
+	#if SHELL_ENABLED
+		processSerial();
+	#endif
+}
+
+void ThreeDRacers::processPackets() {
 	lastPacketCount = packetCount;
 	if (wireless.receive(input, sizeof(input))) {
 
@@ -222,23 +285,23 @@ void ThreeDRacers::Process()
 				packetCount = driveCmd.packetCount;
 				#if SHELL_ENABLED
 				if(netDebug && driveCmd.packetCount % 20 == 0) {
-					SHELLOUTF("[CAR] PKT <- Drive Command (1 of 20): ");
+					SHELLOUTF("[CAR] PKT <- Drive (1 of 20): ");
 					SHELLOUT(driveCmd.packetCount);
 					SHELLOUTF(" brake: ");
 					SHELLOUT(driveCmd.brake);
-					SHELLOUTF(" reverse: ");
+					SHELLOUTF(" rev: ");
 					SHELLOUT(driveCmd.reverse);
-					SHELLOUTF(" steerAngle: ");
+					SHELLOUTF(" angle: ");
 					SHELLOUT(driveCmd.steerAngle);
-					SHELLOUTF(" throttle: ");
+					SHELLOUTF(" thr: ");
 					SHELLOUTln(driveCmd.throttle);
 				}
 				#endif
-				processDriveCommand(driveCmd, carInfo);
+				if(processDriveCommand != NULL) processDriveCommand(driveCmd, carInfo);
 
 				//Send Ack (every 3 pkt):
-				if(driveCmd.packetCount % 3 == 0 || configCmd.flags.gateSensorDebug) {
-					OnAckNotification();
+				if((driveCmd.packetCount % 3 == 0 || configCmd.flags.gateSensorDebug ) /* don't double send if in this tick we found a gate */ && ackCmd.lastGateDetected == 0) {
+					SendAckNotification();
 				}
 			}
 			break;
@@ -254,13 +317,14 @@ void ThreeDRacers::Process()
 				}
 				#endif
 	
-				if(!configCmd.flags.enableGateSensor) {
+				if(configCmd.flags.enableGateSensor) {
 					pinMode(SENSOR_LED_PIN, OUTPUT);
 					digitalWrite(SENSOR_LED_PIN, LOW);
 				}
 				else {
 					pinMode(SENSOR_LED_PIN, INPUT); //High-z
 				}
+				sensor.threshold = (int) configCmd.sensorThreshold;
 				
 				EEPROM_writeAnything(EEPROM_INVERT_STEERING, configCmd.flags.invertSteering);
 				EEPROM_writeAnything(EEPROM_INVERT_THROTTLE, configCmd.flags.invertThrottle);
@@ -270,28 +334,55 @@ void ThreeDRacers::Process()
 					EEPROM_writeAnything(EEPROM_CAR_CALIBRATED, configCmd.flags.calibrated);
 				}
 
-				processConfigCommand(configCmd, carInfo);
+				if(processConfigCommand != NULL) processConfigCommand(configCmd, carInfo);
 			}
 			break;
+		#if !REDUCED_FEATURES
 		case NAME_CMD_ID: //change name
 			memcpy(&nameCmd, &input[0], sizeof(nameCmd));
 			#if SHELL_ENABLED
 			if(netDebug) {
 				SHELLOUTF("[CAR] PKT <-");				
-				SHELLOUTF("nameCmd: ");
+				SHELLOUTF("n: ");
 				SHELLOUTln(nameCmd.name);
 			}
 			#endif
+
+			wireless.sendCommand(String("AT+NAME") + nameCmd.name);
 			wireless.reset();
-			BleSerial->print("AT+NAME");
-			BleSerial->print(nameCmd.name);
 			wireless.initialize();
 			delay(100);
 			break;
+		#endif
+		case IDENTITY_CMD_ID: //ID hash request (the request is splitted in 3 packets)
+			memcpy(&idCmd, &input[0], sizeof(idCmd));
+
+			if(idCmd.msgPart == IDENTITY_GET_SIGNATURE_MSG_PART) {
+
+				GetId((uint8_t*) idCmd.payload);
+				Send(&idCmd, sizeof(idCmd) - (sizeof(idCmd.payload) - 9) ); //This Cmd has variable size (the payload here is 9 bytes)
+				
+			}
+			else {
+				memcpy(idCurrentNonce + (idCmd.msgPart * 12), idCmd.payload, idCmd.msgPart == 2 ? 8 : 12);	
+				if(idCmd.msgPart == 2) {
+					calculateSignature(idCurrentNonce, idCurrentNonce);
+					
+					//Send 32byte reply in 3 packets:
+					SendIdResponse(0, idCurrentNonce);
+					delay(100);
+					SendIdResponse(1, idCurrentNonce);
+					delay(100);
+					SendIdResponse(2, idCurrentNonce);
+					delay(100);
+				}
+			}
+			break;
+		
 		default:
 			#if SHELL_ENABLED
 			if(netDebug) {
-				SHELLOUTF("[CAR] PKT <- Unknown Packet: ");
+				SHELLOUTF("[CAR] PKT <- Unknown: ");
 				SHELLOUT(id);
 				SHELLOUTFln(" [ERR]");
 			}
@@ -300,16 +391,9 @@ void ThreeDRacers::Process()
 		}
 				
 	}
-		
-	//check connection status
-	if (nextConnectionCheck < millis())
-	{
-		ConnectionStatus();
-		ackCmd.batteryLevel = readVcc();
-		nextConnectionCheck = millis() + CONNECTION_CHECK_RATE;
-	}
-	
-	//Serial commands:
+}
+
+void ThreeDRacers::processSerial() {
 	#if SHELL_ENABLED
 	if (Serial && Serial->available() > 0) {
 		String command = Serial->readStringUntil('\n');
@@ -319,7 +403,7 @@ void ThreeDRacers::Process()
 			
 			if(command.startsWith("/at ")) {
 				command.remove(0, 4);
-				wireless.sendCommand(command); //todo: find a way to proxy te response back
+				wireless.sendCommand(command); //todo: find a way to proxy the response back
 			}
 			else if(command.startsWith("/showinfo")) {
 				showInfoShellCommand();
@@ -332,15 +416,14 @@ void ThreeDRacers::Process()
 				SHELLOUTln(command);
 				int angle = command.toInt();
 				if(angle <= 0) {
-					SHELLOUTF("Wrong angle value: ");
+					SHELLOUTF("Wrong: ");
 					SHELLOUT(angle);
 					SHELLOUTFln(" [ERR]");
 				}
 				else {
 					SetServoCenter(command.toInt());
-					SHELLOUTF("Set servo1 center: ");
-					SHELLOUT(angle);
-					SHELLOUTFln(" [OK]");
+					SHELLOUTF("Center: ");
+					SHELLOUTln(angle);
 				}
 			}
 			else if(command.startsWith("/servo1 max ")) {
@@ -348,31 +431,36 @@ void ThreeDRacers::Process()
 				SHELLOUTln(command);
 				int angle = command.toInt();
 				if(angle <= 0) {
-					SHELLOUTF("Wrong angle value: ");
+					SHELLOUTF("Wrong: ");
 					SHELLOUT(angle);
 					SHELLOUTFln(" [ERR]");
 				}
 				else {
 					SetServoMaxAngle(command.toInt());
-					SHELLOUTF("Set servo1 max radius: ");
-					SHELLOUT(angle);
-					SHELLOUTFln(" [OK]");
+					SHELLOUTF("Max radius: ");
+					SHELLOUTln(angle);
 				}
 			}
+			/*else if(command.startsWith("/pinHigh")) {
+				setPin(command, HIGH);
+			}
+		    else if(command.startsWith("/pinLow ")) {
+				setPin(command, LOW);
+			}*/
 			else if(command.startsWith("/netdebug")) {
 				netDebug = !netDebug;
 				if(netDebug) {
-					SHELLOUTFln("Net Packets tracing Enabled [OK]");
+					SHELLOUTFln("ON");					
 				}
 				else {
-					SHELLOUTFln("Net Packets tracing Disabled [OK]");
+					SHELLOUTFln("OFF");
 				}
 			}
 			else if(command.startsWith("/help")) {
 				helpShellCommand();
 			}
 			else {
-				SHELLOUTFln("Unknown Command [ERR]");
+				SHELLOUTFln("Unknown [ERR]");
 				helpShellCommand();
 			}
 		}
@@ -380,57 +468,146 @@ void ThreeDRacers::Process()
 	#endif
 }
 
+/*bool ThreeDRacers::setPin(String &command, bool value) {
+	int pin = command.substring(9).toInt();
+	digitalWrite(pin, HIGH);
+	SHELLOUT(pin);
+	if(value) {
+		SHELLOUTFln(" HIGH");
+	}
+	else {
+		SHELLOUTFln(" LOW");
+	}
+} */
+
 //[INFO] [BLE] PKT freq: #          8ms - byte:17 frag:0 hex: 00 00 42 00 00 00 00 00 00 04 22 00 00 00 00 00 00 1057
 //66
 
 bool ThreeDRacers::updateDriveCommand(char* input)
 {
-	if(!packetCheck(input)) {
+	if(!packetCheck(input, sizeof(driveCmd))) {
 		return false;
 	}
 	memcpy(&driveCmd, &input[0], sizeof(driveCmd));
+
 	return true;
 }
 
-void ThreeDRacers::OnAckNotification()
+void ThreeDRacers::SendAckNotification()
 {
 	ackCmd.packetCount = lastPacketCount;
-	ackCmd.sensorLevel = (short) analogRead(sensorPin);
-	
-	memcpy(&input[0], &ackCmd, sizeof(ackCmd));
-	
+
 	#if SHELL_ENABLED
-	if(netDebug && ackCmd.packetCount % 20 == 0) {
-		SHELLOUTF("[CAR] PKT -> Ack sent back (1 of 20): ");
+	if(netDebug && (ackCmd.packetCount % 20 == 0 || ackCmd.lastGateDetected != 0)) {
+		SHELLOUTF("[CAR] PKT -> Ack (1 of 20): ");
 		SHELLOUT(ackCmd.packetCount);
 		SHELLOUTF(" bat: "); SHELLOUT(ackCmd.batteryLevel);
 		SHELLOUTF(" sens: "); SHELLOUT(ackCmd.sensorLevel);
 		SHELLOUTF(" gate: "); SHELLOUTln(ackCmd.lastGateDetected);
 	}
 	#endif
-	wireless.sendObject(input, sizeof(input));
+	
+	Send(&ackCmd, sizeof(ackCmd));
+}
+
+void ThreeDRacers::SendIdResponse(short msgPart, uint8_t* temp_message)
+{
+	idCmd.packetCount = lastPacketCount;
+	idCmd.msgPart = msgPart;
+	
+	short size = (msgPart == 2) ? 8 : 12;
+	memcpy(&idCmd.payload[0], temp_message + (msgPart*12), size);
+
+	#if SHELL_ENABLED
+	if(netDebug) {
+		SHELLOUTF("[CAR] PKT -> ID HMAC (");
+		SHELLOUT(msgPart+1);
+		SHELLOUT(" of 3): ");
+		
+		for (int i=0; i<( msgPart == 2 ? 8 : 12); i++)
+		{
+		  SHELLOUT(idCmd.payload[i], HEX);
+		  SHELLOUTF(" ");
+		}	
+		SHELLOUTFln("");
+		
+	}
+	#endif
+	
+	Send(&idCmd, sizeof(idCmd) - (sizeof(idCmd.payload) - size));
 }
 
 bool ThreeDRacers::updateConfigCommand(char* input)
 {
-	if(!packetCheck(input)) {
+	if(!packetCheck(input, sizeof(configCmd))) {
 		return false;
 	}
 	memcpy(&configCmd, &input[0], sizeof(configCmd));
 	return true;
 }
 
-bool ThreeDRacers::packetCheck(char* input) {
+bool ThreeDRacers::packetCheck(char* input, unsigned int objSize) {
 	DriveCommand* cmd = (DriveCommand*) input; //Just cast to one of the struct, the first part is the same (id and packetCount)
-	
-	//TODO: do a proper check
+
 	if (lastPacketCount == cmd->packetCount) {
 		#if SHELL_ENABLED
-		if(netDebug) SHELLOUTFln("[CAR] [ERR] Packet rejected: Duplicate packetCount.");
+		if(netDebug) SHELLOUTFln("[CAR] [ERR] Dup. pkt");
 		#endif
 		return false; //Reject Command. 
 	}
+	
+	byte crc = cmd->crc;
+	
+	//Calculate CRC8:
+	cmd->crc = 0x00;
+	byte crcCalc = CRC8((byte*) input, objSize);
+	
+	if(crc != crcCalc) {
+		#if SHELL_ENABLED
+		if(netDebug) {
+			SHELLOUTF("[CAR] [ERR] Crc:");
+			SHELLOUT(crc);
+			SHELLOUTF(" != ");
+			SHELLOUT(crcCalc);
+			SHELLOUTF(" ");
+			for(int c=0; c < objSize; c++) {
+				if(input[c] < 16) SHELLOUT("0");
+				SHELLOUT(input[c], HEX);
+				SHELLOUTF(" ");
+			}
+			SHELLOUTFln("");
+		}
+		#endif
+		//return false;
+	}
 	return true;
+}
+
+void ThreeDRacers::Send(void* data, unsigned int objSize) {
+	DriveCommand* cmd = (DriveCommand*) data; //Just cast to one of the struct, the first part is the same (id and packetCount)
+	
+	//Calculate CRC8:
+	cmd->crc = 0x00;
+	cmd->crc = CRC8((byte*) data, objSize);
+	
+	/*
+	#if SHELL_ENABLED
+		byte* arr = (byte*) data;
+		SHELLOUTF("[CAR] [INFO] Crc:");
+		SHELLOUT(cmd->crc);
+		SHELLOUTF(" ");
+		for(int c=0; c < objSize; c++) {
+			if(arr[c] < 16) SHELLOUT("0");
+			SHELLOUT(arr[c], HEX);
+			SHELLOUTF(" ");
+		}
+		SHELLOUTFln("");
+	#endif
+	*/
+	
+	memcpy(&input[0], data, objSize);
+
+	wireless.sendObject(input, BLE_CMD_SIZE);
 }
 
 void ThreeDRacers::MotorMoveForward(int speed)
@@ -457,55 +634,27 @@ void ThreeDRacers::MotorBrake()
 }
 
 void ThreeDRacers::LedColor(byte red, byte green, byte blue) {
+	#if !REDUCED_FEATURES
 	ledStrip.setPixelColor(0, ledStrip.Color(red, green, blue));
 	ledStrip.show();
-}
-
-void ThreeDRacers::OnGateDetected(float gateTime)
-{
-	float lapTime = gateTime - ackCmd.lastGateDetected;
-	ackCmd.lastGateDetected = gateTime;
-
-	//send lap packet
-	char id = 0;
-	char packet[5];
-
-	unsigned char buf[sizeof(float)];
-	memcpy(buf, &lapTime, sizeof(float));
-
-	packet[0] = id;
-	packet[1] = buf[0];
-	packet[2] = buf[1];
-	packet[3] = buf[2];
-	packet[4] = buf[3];
-
-	DEBUG(F("lap time in char "));
-	for (int i = 0; i < 4; i++)
-	{
-		DEBUGln((int)buf[i]);
-	}
-	DEBUGln(F(""));
-
-	DEBUG(F("lap time sent back: "));
-	DEBUGln(lapTime);
-	wireless.sendObject(&packet, sizeof(packet));
+	#endif
 }
 
 int ThreeDRacers::compensateBatteryLoss(int speed)
 {
-	return constrain(speed * (carInfo.maxBatteryLevel / ackCmd.batteryLevel), 0, 254);
+	return speed;
+	//return constrain(speed * (carInfo.maxBatteryLevel / ackCmd.batteryLevel), 0, 254);
 }
 
 void ThreeDRacers::ConnectionStatus() {
 	if (wireless.isConnected == false) { //Pulse
-		if (connectionLedLoop > 500) {
+		if (connectionLedLoop > 400) {
 			connectionLedLoop = 0;
 		}
 
 		LedColor(0, 0, abs(connectionLedLoop - 255));
 		
-		connectionLedLoop += 4;
-		
+		connectionLedLoop += 20;
 		if(wasConnected) {
 			connectionChanged(false);
 			wasConnected = false;
@@ -526,39 +675,54 @@ void ThreeDRacers::connectionChanged(bool connected)
 		configCmd.packetCount = lastPacketCount++;
 		#if SHELL_ENABLED
 		if(netDebug) {
+			//NB: during configuration the cars automaticly disconnect due to a timeout
+			SHELLOUTFln("[CAR] Connected [OK]");
 			SHELLOUTF("[CAR] PKT ->");
 			debugConfigPck();
 		}
 		#endif
-		memcpy(&input[0], &configCmd, sizeof(configCmd));
-		wireless.sendObject(input, sizeof(input));
+
+		Send(&configCmd, sizeof(configCmd));
 	}
 	else {
+		#if SHELL_ENABLED
+		if(netDebug) {
+			SHELLOUTFln("[CAR] Disconnected  [OK]");
+		}
+		#endif
 		MotorStop();
 		SetServo(0);
 	}
 }
 
-
 void ThreeDRacers::debugConfigPck() {
 #if SHELL_ENABLED
-	SHELLOUTF(" Car Config Info. steerCenter: ");
+	SHELLOUTF(" Car Config Info. sC: ");
 	SHELLOUT(configCmd.steerCenter);
 	if(configCmd.flags.steerCenterChanged) SHELLOUTF(" X");
-	SHELLOUTF(" steerMax: ");
+	SHELLOUTF(" sM: ");
 	SHELLOUT(configCmd.steerMax);
 	if(configCmd.flags.steerMaxChanged) SHELLOUTF(" X");
 	
-	SHELLOUTF("invertSteering: ");
+	SHELLOUTF(" c: ");
+	if(configCmd.flags.calibrated) SHELLOUTF(" X");
+	
+	SHELLOUTF("iS: ");
 	if(configCmd.flags.invertSteering) SHELLOUTF(" X");
 	
-	SHELLOUTF("invertThrottle: ");
+	SHELLOUTF("iT: ");
 	if(configCmd.flags.invertThrottle) SHELLOUTF(" X");
 	
-	SHELLOUTF(" sensor: ");
-	SHELLOUT(configCmd.flags.enableGateSensor);
+	SHELLOUTF(" s: ");
+	if(configCmd.flags.enableGateSensor) SHELLOUTF(" X");
+	
+	SHELLOUTF(" ");
+	SHELLOUT(configCmd.sensorThreshold);
+	
 	SHELLOUTF(" dbg: ");
-	SHELLOUTln(configCmd.flags.gateSensorDebug);
+	if(configCmd.flags.gateSensorDebug) SHELLOUTF(" X");
+	
+	SHELLOUTFln("");
 #endif
 }
 
@@ -577,7 +741,7 @@ short ThreeDRacers::bitShiftCombine(unsigned char x_high, unsigned char x_low)
 
 void ThreeDRacers::SetServo(int value){
 	short invert = configCmd.flags.invertSteering ? -1 : +1;
-	int steerAngle = map(value, invert*-90, invert* 90, configCmd.steerCenter + invert*configCmd.steerMax, configCmd.steerCenter - invert*configCmd.steerMax); //Nb: inverted min and max (inverted rotation since the servo is upsidedown)
+	int steerAngle = map(value, invert*-90, invert* 90, configCmd.steerCenter - configCmd.steerMax, configCmd.steerCenter + configCmd.steerMax);
 	servo.write(steerAngle);
 }
 void ThreeDRacers::SetServoCenter(int value)
@@ -615,11 +779,6 @@ void ThreeDRacers::motorSetup() {
 	pinMode(MOTOR_MODE_PIN, OUTPUT);
 	digitalWrite(MOTOR_MODE_PIN, MOTOR_MODE_PH_EN ? HIGH : LOW); //Motor mode: Phase/Enable
 
-#if SOFTWARE_PWM
-	SoftPWMBegin();
-	SoftPWMSetFadeTime(13, 100, 500);
-#endif
-
 }
 
 void ThreeDRacers::MotorControl(int controlSpeed, bool brake) {
@@ -627,41 +786,35 @@ void ThreeDRacers::MotorControl(int controlSpeed, bool brake) {
 	controlSpeed = (configCmd.flags.invertThrottle ? -1 : 1) * controlSpeed;
 	
 #if MOTOR_MODE_PH_EN
+	//PHase/ENable mode:
 	if (brake) { //Brake:
-		//pinMode(MOTOR_PIN1, INPUT);
-		digitalWrite(MOTOR_PIN1, LOW); //<- TODO: doesn't work, just coasts
+		//pinMode(MOTOR_PIN1, INPUT);  //<- TODO: doesn't work
 		
+		digitalWrite(MOTOR_MODE_PIN, HIGH);
+		digitalWrite(MOTOR_PIN1, LOW);
 		analogWrite(MOTOR_PIN2, LOW);
-		#if SOFTWARE_PWM
-			SoftPWMSet(MOTOR_PIN2, 0);
-		#endif
 	}
 	else {
-		//pinMode(MOTOR_PIN1, OUTPUT);
+		pinMode(MOTOR_PIN1, OUTPUT);
 
-		if (controlSpeed == 0) { //Coasts:
-			digitalWrite(MOTOR_PIN1, HIGH);
-#if SOFTWARE_PWM
-			SoftPWMSet(MOTOR_PIN2, 0);
-#else
+		if (controlSpeed == 0) { //Coasts (Switching to IN/IN mode since Phase/Enable doesn't support coasting):
+			#if MOTOR_RUN_METHOD == 0
+				digitalWrite(MOTOR_MODE_PIN, LOW);
+			#endif
+			digitalWrite(MOTOR_PIN1, LOW);
 			analogWrite(MOTOR_PIN2, LOW);
-#endif 
-		}
-		else if (controlSpeed > 0) { //Forward
-			digitalWrite(MOTOR_PIN1, HIGH);
-#if SOFTWARE_PWM
-			SoftPWMSet(MOTOR_PIN2, abs(controlSpeed));
-#else
-			analogWrite(MOTOR_PIN2, abs(controlSpeed));
-#endif 
 		}
 		else {
-			digitalWrite(MOTOR_PIN1, LOW);
-#if SOFTWARE_PWM
-			SoftPWMSet(MOTOR_PIN2, abs(controlSpeed));
-#else
+			digitalWrite(MOTOR_MODE_PIN, HIGH);
+			
+			if (controlSpeed > 0) { //Forward
+			digitalWrite(MOTOR_PIN1, HIGH);
 			analogWrite(MOTOR_PIN2, abs(controlSpeed));
-#endif 
+			}
+			else {
+				digitalWrite(MOTOR_PIN1, LOW);
+				analogWrite(MOTOR_PIN2, abs(controlSpeed));
+			}
 		}
 	} 
 #else
@@ -686,13 +839,15 @@ void ThreeDRacers::MotorControl(int controlSpeed, bool brake) {
 
 void ThreeDRacers::showInfoShellCommand() {
 	#if SHELL_ENABLED
-	char name[13];
-	int found = wireless.getBLEName(*BleSerial, name, sizeof(name));
-	if(found) {
-		SHELLOUT(name);
-	}
-	else {
-		SHELLOUTF("BLE-ERROR");
+	if(!wireless.isConnected) {
+		char name[13];
+		int found = wireless.getBLEName(*BleSerial, name, sizeof(name));
+		if(found) {
+			SHELLOUT(name);
+		}
+		else {
+			SHELLOUTF("BLE-ERROR");
+		}
 	}
 
 	SHELLOUTF(" - RacersOS v");
@@ -702,15 +857,16 @@ void ThreeDRacers::showInfoShellCommand() {
 	SHELLOUTF(" (p");
 	SHELLOUT(PROTOCOL_VERSION);
 	SHELLOUTFln(")");
-	SHELLOUT("Battery Level: ");
+	printId();
+	SHELLOUT("Vcc Level: ");
 	SHELLOUT(round(100.0 / (1.0*(carInfo.maxBatteryLevel - carInfo.minBatteryLevel) / (ackCmd.batteryLevel - carInfo.minBatteryLevel))));
 	SHELLOUTF("% (");
 	SHELLOUT(ackCmd.batteryLevel / 1000.0);
 	SHELLOUTFln("v)");
 	
-	SHELLOUTF("Servo config: center: ");
+	SHELLOUTF("Servo: ");
 	SHELLOUT(configCmd.steerCenter);
-	SHELLOUTF(" max radius: ");
+	SHELLOUTF(" max: ");
 	SHELLOUT(configCmd.steerMax);
 	if(configCmd.flags.invertSteering) {
 		SHELLOUTF("(inverted)");
@@ -718,10 +874,10 @@ void ThreeDRacers::showInfoShellCommand() {
 	SHELLOUTFln("");
 	
 	if(configCmd.flags.invertThrottle) {
-		SHELLOUTFln("Throttle: inverted)");
+		SHELLOUTFln("Throttle: inverted");
 	}
 
-	SHELLOUTF("Remote: ");
+	SHELLOUTF("App: ");
 	if(wireless.isConnected) {
 		SHELLOUTFln("connected");
 	}
@@ -736,31 +892,31 @@ void ThreeDRacers::showInfoShellCommand() {
 void ThreeDRacers::helpShellCommand() {
 	#if SHELL_ENABLED
 	SHELLOUTFln("/at AT+* : Send BLE commands");
-	SHELLOUTFln("/showinfo : Get actual car configuration");
-	SHELLOUTFln("/motorscheck : Move the servos R/L and the motors F/B");
-	SHELLOUTFln("/servo1 center <angle> : Set servo center position");
-	SHELLOUTFln("/servo1 max <angle> : Set servo max rotation angle");
-	SHELLOUTFln("/netdebug : Enable/Disable net packets trace");
+	SHELLOUTFln("/showinfo : Info");
+	SHELLOUTFln("/motorscheck : Move motors/servos");
+	SHELLOUTFln("/servo1 center <angle> : Set servo center");
+	SHELLOUTFln("/servo1 max <angle> : Set servo max angle");
+	SHELLOUTFln("/netdebug : Enable/Disable net dbg");
+	//SHELLOUTFln("/pinHigh/Low : digitalWrite");
 	SHELLOUTFln("");
-	SHELLOUTFln("Type in your console to input command");
 	SHELLOUTFln(":>");
 	#endif
 }
 
 void ThreeDRacers::checkMotorsCommand() {
 	#if SHELL_ENABLED
-	SHELLOUTF("Test Servo1: [RIGHT]");
+	SHELLOUTF("Test Servo1: [R]");
 	servo.write(driveCmd.steerAngle + configCmd.steerMax);
 	delay(500);
-	SHELLOUTF(" [LEFT]");
+	SHELLOUTF(" [L]");
 	servo.write(driveCmd.steerAngle - configCmd.steerMax);
 	delay(500);
 	servo.write(driveCmd.steerAngle);
-	SHELLOUTFln(" [COMPLETED]");
+	SHELLOUTFln("");
 	
 	delay(500);
 	
-	SHELLOUTF("Testing MotorA [FORWARD]");
+	SHELLOUTF("Testing MotorA [F]");
 	MotorControl(255, false);
 	delay(200);
 	MotorControl(150, false);
@@ -773,7 +929,7 @@ void ThreeDRacers::checkMotorsCommand() {
 	delay(500);
 	MotorControl(0, false);
 	delay(500);
-	SHELLOUTF(" [BACKWARD]");
+	SHELLOUTF(" [B]");
 	MotorControl(-255, false);
 	delay(200);
 	MotorControl(-150, false);
@@ -785,7 +941,7 @@ void ThreeDRacers::checkMotorsCommand() {
 	MotorControl(-80, false);
 	delay(500);
 	MotorControl(0, false);
-	SHELLOUTFln(" [COMPLETED]");
+	SHELLOUTFln(" [DONE]");
 	#endif
 }
 
@@ -813,6 +969,102 @@ long ThreeDRacers::readVcc() {
  
   result = 1125300L / result; // Calculate Vcc (in mV); 1125300 = 1.1*1023*1000
   return result; // Vcc in millivolts
+}
+
+void ThreeDRacers::printId() {
+	#if SHELL_ENABLED
+	SHELLOUTF("Id: ");
+	uint8_t rx_buffer[9];
+	GetId(rx_buffer);
+	
+    for (int i=0; i<9; i++)
+    {
+	  SHELLOUT(rx_buffer[i], HEX);
+	  SHELLOUTF(" ");
+    }	
+	SHELLOUTFln("");
+	#endif
+}
+
+void ThreeDRacers::GetId(uint8_t* rx_buffer) {
+    byte returnValue;
+	returnValue = identity.sha204p_wakeup();
+    returnValue = identity.getSerialNumber(rx_buffer);
+	identity.sha204p_sleep();
+}
+
+#define SHA204_SERIAL_SZ    9
+#define SHA_MSG_SIZE                    (64)                   //!< SHA message data size
+#define HMAC_MODE_SOURCE_FLAG_MATCH     ((uint8_t) 0x04)       //!< HMAC mode bit  2: match TempKey.SourceFlag
+
+void ThreeDRacers::calculateSignature(uint8_t* temp_message, uint8_t* current_nonce) { 
+  //uint8_t temp_message[SHA_MSG_SIZE];
+  uint8_t rx_buffer[SHA204_RSP_SIZE_MAX];
+  uint8_t tx_buffer[SHA204_CMD_SIZE_MAX];
+
+  /*memset(temp_message, 0, 32);
+  memcpy(temp_message, message, msgLength);*/
+
+  //memcpy(current_nonce, nonce, NONCE_NUMIN_SIZE_PASSTHROUGH);
+  // We set the part of the 32-byte nonce that does not fit into a message to 0xAA
+  //memset(&current_nonce[nonceLength], 0xAA, sizeof(current_nonce)-nonceLength);
+   
+   identity.sha204p_wakeup();
+   
+  // Program the data to sign into the ATSHA204
+  (void)identity.sha204m_execute(SHA204_WRITE, SHA204_ZONE_DATA | SHA204_ZONE_COUNT_FLAG, 8 << 3, 32, temp_message,    /* Full version of lib requires: */ 0, NULL, 0, NULL, //*/
+                  WRITE_COUNT_LONG, tx_buffer, WRITE_RSP_SIZE, rx_buffer);
+
+
+  // Program the nonce to use for the signature (has to be done just before GENDIG due to chip limitations)
+  (void)identity.sha204m_execute(SHA204_NONCE, NONCE_MODE_PASSTHROUGH, 0, NONCE_NUMIN_SIZE_PASSTHROUGH, current_nonce, /* Full version of lib requires: */ 0, NULL, 0, NULL, //*/
+                  NONCE_COUNT_LONG, tx_buffer, NONCE_RSP_SIZE_SHORT, rx_buffer);
+
+  // Purge nonce when used
+  //memset(current_nonce, 0x00, NONCE_NUMIN_SIZE_PASSTHROUGH);
+
+  // Generate digest of data and nonce
+  (void)identity.sha204m_execute(SHA204_GENDIG, GENDIG_ZONE_DATA, 8, 0, NULL,    /* Full version of lib requires: */ 0, NULL, 0, NULL, //*/
+                  GENDIG_COUNT_DATA, tx_buffer, GENDIG_RSP_SIZE, rx_buffer);
+
+  // Calculate HMAC of message+nonce digest and secret key
+  (void)identity.sha204m_execute(SHA204_HMAC, HMAC_MODE_SOURCE_FLAG_MATCH, 0, 0, NULL,     /* Full version of lib requires: */ 0, NULL, 0, NULL, //*/
+                  HMAC_COUNT, tx_buffer, HMAC_RSP_SIZE, rx_buffer);
+
+  // Put device back to sleep
+  identity.sha204p_sleep();
+
+  memcpy(temp_message, &rx_buffer[SHA204_BUFFER_POS_DATA], MAC_CHALLENGE_SIZE);
+
+  /*for (int i=0; i<sizeof(rx_buffer); i++)
+  {
+    SHELLOUT(rx_buffer[i], HEX);
+    SHELLOUT(' ');
+  }
+  SHELLOUTFln("");*/
+}
+
+const unsigned char CRC7_POLY = 0x91;
+//TO calculate manually: http://tomeko.net/online_tools/crc8.php?lang=en
+byte ThreeDRacers::CRC8(const uint8_t* message, int len) //Dallas/Maxim
+{
+  byte crc = 0x00;
+  int c = 0;
+  byte extract;
+  byte sum;
+  while (len--) {
+    extract = (byte) message[c];
+    ++c;
+    for (byte tempI = 8; tempI; tempI--) {
+      sum = (crc ^ extract) & 0x01;
+      crc >>= 1;
+      if (sum) {
+        crc ^= 0x8C;
+      }
+      extract >>= 1;
+    }
+  }
+  return crc;
 }
 
 #endif

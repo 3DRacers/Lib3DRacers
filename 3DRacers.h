@@ -1,11 +1,3 @@
-////////
-//
-//Written by Marco D'Alia and Davide Marcoccio
-//2015
-//
-//
-////////
-
 #ifndef THREEDRACERS_H
 #define THREEDRACERS_H
 
@@ -15,14 +7,18 @@
 
 #include <Servo.h>
 #include <Adafruit_NeoPixel.h>
+#include <sha204_library.h>
 
 #include "3DRacers_Packets.h"
 #include "BleHM10Driver.h"
+#include "IRSensor.h"
 
 //#include "variants/3DRacers_Pins_1.1.0.h"
 //#include "variants/3DRacers_Pins_1.2.0.h"
 //#include "variants/3DRacers_Pins_1.4.5.h"
-#include "variants/3DRacers_Pins_1.5.6.h"
+//#include "variants/3DRacers_Pins_1.5.6.h"
+//#include "variants/3DRacers_Pins_1.6.1.h"
+#include "variants/3DRacers_Pins_1.6.2.h"
 //#include "variants/3DRacers_Pins_Breadboard.h"
 #include "Config.h"
 
@@ -48,8 +44,8 @@ typedef struct CarInfo
 
 	CarInfo()
 	{
-		maxBatteryLevel = 4200;
-		minBatteryLevel = 2800;
+		maxBatteryLevel = 3330;
+		minBatteryLevel = 3200;
 		
 		throttle = 0;
 		steerAngle = 45;
@@ -64,9 +60,6 @@ class ThreeDRacers
 
 public:
 
-	int gateMinDelay; 
-	int gatePower;
-	
 	int servoPin;
 	int sensorPin;
 	int ledPin;
@@ -74,14 +67,18 @@ public:
 	bool netDebug;
 	Servo servo;
 	
+	#if !REDUCED_FEATURES
 	Adafruit_NeoPixel ledStrip;
+	#endif
 	
+	atsha204Class identity;
+	void GetId(uint8_t* rx_buffer);
 	
 	ThreeDRacers();
 	
 	//Use to start in your setup() function
 	void Begin(HardwareSerial &bleSerial, Serial_ &serial);
-	
+
 	//Call it repeatly in your loop() function:
 	void Process();
 
@@ -100,21 +97,26 @@ public:
 	//to be used for low level control, use Motor* functions if possible
 	void MotorControl(int controlSpeed, bool brake);
 
-	
+	char input[BLE_CMD_SIZE];
+		
 	//CALLBACKS
 
 	//Set this callbacks to your functions to customize the bot behaviour:
-	void OnConnect(void(*f)(CarInfo&, ConfigCommand&)){ processConnectCommand = f; }	
-	void OnDriveCommand(void(*f)(DriveCommand&, CarInfo&)){ processDriveCommand = f; }		
-	void OnConfigCommand(void(*f)(ConfigCommand&, CarInfo&)){ processConfigCommand = f; }
-	void OnRaw1Command(void(*f)(void*, CarInfo&)){ processRaw1Command = f; }
-//	void (*OnGateDetected)(CarInfo& car){}
+	void OnConnect(void(*f)(CarInfo&, ConfigCommand&)) { processConnectCommand = f; }	
+	void OnDriveCommand(void(*f)(DriveCommand&, CarInfo&)) { processDriveCommand = f; }		
+	void OnConfigCommand(void(*f)(ConfigCommand&, CarInfo&)) { processConfigCommand = f; }
+	void OnRaw1Command(void(*f)(void*, CarInfo&)) { processRaw1Command = f; }
+	void OnGateDetected(void(*f)(AckCommand& cmd, CarInfo& car)) { processOnGateDetected = f; }
 
 	//TX towards central device
-	void OnAckNotification();
+	void SendAckNotification();
 
-
+	void Send(void* packet, unsigned int objSize);
+	
+	BleHM10Driver wireless;
+	
 private:
+	unsigned int tickCount;
 	int connectionLedLoop;
 	bool wasConnected;
 	
@@ -124,17 +126,21 @@ private:
 	const int EEPROM_INVERT_STEERING;
 	const int EEPROM_INVERT_THROTTLE;
 	
-	char input[BLE_CMD_SIZE];
-	unsigned long packetCount;
-	unsigned long lastPacketCount;
-	unsigned long nextConnectionCheck;
-	BleHM10Driver wireless;
 
+	unsigned int packetCount;
+	unsigned int lastPacketCount;
+	unsigned long nextConnectionCheck;
+
+	IRSensor sensor;
+	
 	CarInfo carInfo;
 	DriveCommand driveCmd;
 	ConfigCommand configCmd;
 	AckCommand ackCmd;
 	NameCommand nameCmd;
+	IdentityCommand idCmd;
+	
+	uint8_t idCurrentNonce[32];
 	
 	//
 	/*------------------------------------------------------*/
@@ -154,8 +160,11 @@ private:
 	void(*processConnectCommand)(CarInfo& car, ConfigCommand& config);
 	void(*processDriveCommand)(DriveCommand& cmd, CarInfo& car);
 	void(*processConfigCommand)(ConfigCommand& cmd, CarInfo& car);
+	void(*processOnGateDetected)(AckCommand& cmd, CarInfo& car);
 	void(*processRaw1Command)(void* cmd, CarInfo& car);
 
+	void SendIdResponse(short msgPart, uint8_t* temp_message);
+	
 	//called inside Begin()
 	void motorSetup();
 	//unify 2 bytes into an int16
@@ -167,7 +176,7 @@ private:
 	void ConnectionStatus();
 	void connectionChanged(bool connected);
 	void debugConfigPck();
-	bool packetCheck(char* input);
+	bool packetCheck(char* input, unsigned int objSize);
 	
 	//structs update funcs, called right before it's function ptr companion
 	bool updateDriveCommand(char* input);
@@ -177,7 +186,18 @@ private:
 	void showInfoShellCommand();
 	void checkMotorsCommand();
 	
+	
+	void processSerial();
+	void processPackets();
+	
 	long readVcc();
+	
+	void printId();
+	void calculateSignature(uint8_t* temp_message, uint8_t* current_nonce);
+	
+	byte CRC8(const uint8_t* message, int len);
+	
+	//bool setPin(String& command, bool value);
 };
 
 #endif

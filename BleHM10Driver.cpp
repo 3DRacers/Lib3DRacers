@@ -18,7 +18,6 @@ BleHM10Driver::BleHM10Driver() :
 {
 }
 
-
 void BleHM10Driver::begin(HardwareSerial &bleSerial, Serial_ &serial, byte resetPin) {
 	lastPacketTime = millis();
 	BleSerial = &bleSerial;
@@ -30,15 +29,15 @@ void BleHM10Driver::begin(HardwareSerial &bleSerial, Serial_ &serial, byte reset
 }
 
 void BleHM10Driver::initialize() {
-	STARTLOGFln("[BLE] Initializing module:");
+	STARTLOGFln("[BLE] Initializing:");
 	
 	reset();
 	
 	//Try to communicate with the standard baud rate to set our desired baud:
-	//Baud Rate 0---------9600 1---------19200 2---------38400 3---------57600 4---------115200
+	//Baud Rate 0---------9600 1---------19200 2---------38400 3---------57600 4---------115200 5---------4800 6---------2400 7---------1200 8---------230400
 	STARTLOGF("[BLE] +- Setting baud rate to: ");
 	STARTLOG(baud);
-	const long allowedBauds[] = { 9600, 19200, 38400, 57600, 115200 };
+	const long allowedBauds[] = { 9600, 19200, 38400, 57600, 115200, 4800, 2400, 1200, 230400 };
 	bool baudFound = false;
 	for(int c=0; c < 5; c++) {
 		if(setBaud(allowedBauds[c], "AT+BAUD3")) {
@@ -49,55 +48,19 @@ void BleHM10Driver::initialize() {
 	}
 	if(!baudFound) {
 		STARTLOGFln(" [ERR] Not Found!");
+		//If BLE module not working, put the Pilot board in update mode. (ie: console is proxied directly to the BLE module)
+		updateMode();
+		return;
 	}
+	
 	BleSerial->begin(57600);
 	
+	#if STARTUP_LOG
 	BleSerial->print("AT+VERR?");
-	STARTLOGF("[BLE] +- Module version: ");
+	STARTLOGF("[BLE] +- Ver: ");
 	STARTLOG(BleSerial->readString());	
-    STARTLOGFln(" [OK]");		
-
-	//Change factory name:
-	STARTLOGF("[BLE] +- Name: ");
-	char name[13];
-	int found = getBLEName(*BleSerial, name, sizeof(name));
-	if(found > 0) {
-		STARTLOG(name);
-		STARTLOGFln(" [OK]");
-		/* TODO: some memory error causes a crash here:
-		const char factoryName[] = { 'H', 'M', 'S', 'o', 'f', 't' };
-		/*bool sameName = true;
-		for(int c = 0; c < 6; c++) {
-			if(name[c] != factoryName[c]) {
-				sameName = false;
-				break;
-			}
-		}
-		if(sameName) {		
-			//Factory reset:
-			//BleSerial->print("AT+RENEW");
-			//delay(200);
-			//TODO: this reset also the baud
-			
-			//NB: can't use random or snprintf since the sketch size is too big!
-			/*char buffer[18];
-			for(int c=0; c < 100; c++) {
-				analogRead(A0);
-			}
-			randomSeed(analogRead(A0));
-			
-			snprintf (buffer, 18, "AT+NAME3DRacers%d", random(10, 99));
-			*//*
-			BleSerial->print("AT+NAME3DRacers");
-			BleSerial->print(analogRead(A0));
-			delay(100);
-			STARTLOGF("[BLE] +- Default name set.");
-			STARTLOGFln(" [OK]");
-		}*/
-	}
-	else {
-		STARTLOGFln("[ERR]");
-	}
+    STARTLOGFln(" [OK]");
+	#endif
 	
 	executeCommand("AT+MODE0"); //0: Transmission Mode (after connection. act as a transparent serial proxy) 1: PIO collection Mode +Mode 0 2: Remote Control Mode+ Mode 0
 	executeCommand("AT+ROLE0"); //0: Peripheral (ie: client, while the remote is the master "Central" node) 1: Central
@@ -106,6 +69,16 @@ void BleHM10Driver::initialize() {
 	//Disabled in V526: executeCommand("AT+FIOW0"); //Flow control: 0 disabled, 1 enabled, default 0 (Need RTS and CTS pin connected)
 	executeCommand("AT+SHOW1"); //Show name in discovery
 	executeCommand("AT+TYPE0"); //No PIN
+	
+	//V540:
+	/*executeCommand("AT+COMI9"); //Minimum Link Layer connection interval 0: 7.5ms; 1: 10ms; 2: 15ms; 3: 20ms; 4: 25ms; 5: 30ms; 6: 35ms; 7: 40ms; 8: 45ms; 9: 4000ms, default: 3
+	executeCommand("AT+COMA9"); //Maximum Link Layer connection interval 0: 7.5ms; 1: 10ms; 2: 15ms; 3: 20ms; 4: 25ms; 5: 30ms; 6: 35ms; 7: 40ms; 8: 45ms; 9: 4000ms, default: 7
+	executeCommand("AT+COLA4"); //Link Layer connection slave latency 0 ~ 4; Default: 0
+	executeCommand("AT+COSU0"); //Link Layer connection supervision timeout  0: 100ms; 1: 1000ms; 2: 2000ms; 3: 3000ms; 4: 4000ms; 5: 5000ms; 6: 6000ms; Default: 6(6000ms);
+	executeCommand("AT+COUP1"); //Switch slave role update connection parameter  0, 1; Default: 1(Update on);
+	executeCommand("AT+GAIN1"); // 0: No RX gain 1: Open RX gain, default: 0
+	*/
+	
 	//Disabled in V526: executeCommand("AT+GAIN0"); // 0: No RX gain 1: Open RX gain, default: 0
 	executeCommand("AT+IMME1"); //0: Start immediately, not used in peripheral mode, 1: Wait for AT+START
 	BleSerial->print("AT+START"); //Start connecting, used only with IMME1
@@ -141,34 +114,44 @@ void BleHM10Driver::reset() {
 }
 
 void BleHM10Driver::sendCommand(String command) {
-
+	#if not REDUCED_FEATURES
 	if(command == "AT+SBLUP") {
-		DEBUGln(F("[BLE] Entering BLE Module update mode [OK]"));
-		isUpdating = true;
-
-		DEBUGln(F("[BLE] Now you can close the console and open the HMSoft update tool (115200 baud set). [OK]"));
-		executeCommand("AT+SBLUP");
-
-		//In Update mode the module requires 115200 baud:
-		BleSerial->flush();
-		delay(50);
-		BleSerial->end();
-		delay(100);
-		BleSerial->begin(115200);
-
-		//And Arduino:
-		Serial->flush();
-		delay(50);
-		Serial->end();
-		delay(100);
-		Serial->begin(115200);
+		BleSerial->print(command);
+		updateMode();
 	}
 	else {
+		if (isConnected) {
+			reset();
+			delay(500);
+		}
+				
 		BleSerial->print(command);
 		#if SHELL_ENABLED
 			SHELLOUTln(BleSerial->readString());
 		#endif
 	}
+	#endif
+}
+
+void BleHM10Driver::updateMode() {
+	#if not REDUCED_FEATURES
+	isUpdating = true;
+	SHELLOUTln(F("[BLE] Update mode (115200 baud set). [OK]"));
+
+	//In Update mode the module requires 115200 baud:
+	BleSerial->flush();
+	delay(50);
+	BleSerial->end();
+	delay(100);
+	BleSerial->begin(115200);
+
+	//And Arduino:
+	Serial->flush();
+	delay(50);
+	Serial->end();
+	delay(100);
+	Serial->begin(115200);
+	#endif
 }
 
 bool BleHM10Driver::executeCommand(char* PROGMEM command) {
@@ -176,7 +159,7 @@ bool BleHM10Driver::executeCommand(char* PROGMEM command) {
 	STARTLOG(command);
 	BleSerial->print(command); //0: Transmission Mode (after connection. act as a transparent serial proxy) 1: PIO collection Mode +Mode 0 2: Remote Control Mode+ Mode 0
 	if(!BleSerial->find("OK")) { 
-		STARTLOGFln(" Module doesn't respond or doesn't recognize command! [ERR]"); 
+		STARTLOGFln(" Cmd not recognized! [ERR]"); 
 		return false;
 	}
 	STARTLOGFln(" [OK]");
@@ -187,7 +170,12 @@ bool BleHM10Driver::executeCommand(char* PROGMEM command) {
 bool BleHM10Driver::setBaud(long baud, char* newBaud) {
 	STARTLOGF(" - ");
 	STARTLOG(baud);
+	BleSerial->flush();
+	delay(50);
+	BleSerial->end();
+	delay(100);
 	BleSerial->begin(baud); //Start with default baud for module
+	delay(100);
 	//Change BAUD (if already set, ignore it):
 	BleSerial->print(newBaud); 
 	delay(100);
@@ -213,15 +201,15 @@ bool BleHM10Driver::receive(char* input, int size) {
 		byte packetResults = StreamSend::receiveObject(*BleSerial, input, size);
 
 		if (StreamSend::isPacketGood(packetResults)) {
-			#if SERIAL_DEBUG_NET
+
+			#if SHELL_ENABLED
 			if(!isConnected) {
-				DEBUGln(F("[BLE] Connected. [OK]"));
+				SHELLOUTFln("[BLE] Connected. [OK]");
 			}
 			#endif
 			isConnected = true;
 
 			#if SERIAL_DEBUG_NET
-				
 
 				long freq = millis() - lastPacketTime;
 				DEBUGNET(F("[INFO] [BLE] PKT freq: "));
@@ -249,26 +237,6 @@ bool BleHM10Driver::receive(char* input, int size) {
 			#endif
 			
 			lastPacketTime = millis();
-				
-			//    //Check for sanity (errors comes from BLE to Arduino communication):
-			//    lastCrc = rcv.crc;
-			//    rcv.crc = 0x00;
-			//    if(lastCrc != CRC8((byte*)(&rcv), sizeof(rcv))) {
-			//      #if SERIAL_DEBUG
-			//        Serial.println("Packet rejected: Wrong CRC.");
-			//      #endif
-			//  
-			//      return; //Reject Command. 
-			//    }
-
-			//    #if SERIAL_DEBUG
-			//    Serial.println("Packet good");
-			//    int i;
-			//    for (i = 0; i < inputSize; ++i) {
-			//      Serial.print(input[i]);
-			//      Serial.print(",");
-			//    }
-			//    #endif
 			
 			found = true;
 		}
@@ -299,7 +267,8 @@ bool BleHM10Driver::receive(char* input, int size) {
 	}
 	
 	if(isConnected && lastPacketTime +timeout < millis()) {
-		DEBUGln(F("[BLE] Timeout Disconnected. [ERR]"));
+		//NB: during configuration the cars automaticly disconnect due to a timeout (since no DriveCmd packets are sent during the car setup)
+		SHELLOUTFln("[BLE] Timeout Disconnected. [ERR]");
 		isConnected = false;
 	}
 	return found;
@@ -307,15 +276,14 @@ bool BleHM10Driver::receive(char* input, int size) {
 
 void BleHM10Driver::printHex(char X) {
 
-   if (X < 16) {Serial->print("0");}
-
-   Serial->print(X, HEX);
+   if (X < 16) { DEBUGNET("0"); }
+   DEBUGNET(X, HEX);
 
 }
 
 void BleHM10Driver::sendObject(void* packet, unsigned int objSize) {
 	#if SERIAL_DEBUG_NET
-	DEBUGNET(F("[INFO] [BLE] PKT ack: "));
+	DEBUGNET(F("[INFO] [BLE] "));
 	byte * b = (byte *) packet;
 	for(int c=0; c < objSize; c++) {
 		printHex(b[c]);
@@ -327,6 +295,7 @@ void BleHM10Driver::sendObject(void* packet, unsigned int objSize) {
 }
 
 int BleHM10Driver::getBLEName(Stream &ostream, char* ptr, unsigned int objSize) {
+	#if !REDUCED_FEATURES
 	//empty receive buffer
 	ostream.flush();
 	delay(100);
@@ -340,15 +309,15 @@ int BleHM10Driver::getBLEName(Stream &ostream, char* ptr, unsigned int objSize) 
 	delay(200);
 	
 	if(!ostream.find("OK+NAME:")) {
-		DEBUGln(F("[BLE] Module name not found! [ERR]"));
+		DEBUGln(F("[BLE] Name not found! [ERR]"));
 		return 0;
 	}
 	
 	//message is ok. Read name now
 	if (ostream.available()){
 
-		char name[13];
-		int bytes = ostream.readBytes(name, 12); //12 is max length by HM-10 doc
+		char name[14];
+		int bytes = ostream.readBytes(name, 13); //12 is max length by HM-10 doc
 		if(bytes == 0) return 0;
 		
 		name[bytes+1] = '\0'; //String terminator
@@ -357,27 +326,8 @@ int BleHM10Driver::getBLEName(Stream &ostream, char* ptr, unsigned int objSize) 
 
 		return bytes+1;
 	}
-
+	#endif
 	return 0;
-}
-
-
-//CRC-8 - based on the CRC8 formulas by Dallas/Maxim
-//code released under the therms of the GNU GPL 3.0 license
-byte BleHM10Driver::CRC8(const byte *data, byte len) {
-  byte crc = 0x00;
-  while (len--) {
-    byte extract = *data++;
-    for (byte tempI = 8; tempI; tempI--) {
-      byte sum = (crc ^ extract) & 0x01;
-      crc >>= 1;
-      if (sum) {
-        crc ^= 0x8C;
-      }
-      extract >>= 1;
-    }
-  }
-  return crc;
 }
 
 #endif

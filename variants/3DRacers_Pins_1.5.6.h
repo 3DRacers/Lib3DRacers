@@ -3,7 +3,7 @@
 
 //SETTINGS
 
-#define MOTOR_MODE_PH_EN    true   // false: Phase/Enable mode
+#define MOTOR_MODE_PH_EN    false   // false: Phase/Enable mode
 #define MOTOR_MODE_PIN  	12
 //#define MOTOR_PIN1      	5   // DRV883c IN PH B <- pin rotto sulla 1.5.6, in futuro ok ma cmq senza PWM sul PH
 //#define MOTOR_PIN2      	4   // DRV883c IN EN B    
@@ -17,6 +17,9 @@
 #define SENSOR_LED_PIN 		A4
 #define SERVO_PIN 			3
 #define BLE_RESET			2
+
+#define IDENTITY_PIN		8
+
 
 #endif
 

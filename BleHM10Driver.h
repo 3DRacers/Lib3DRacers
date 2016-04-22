@@ -25,7 +25,6 @@ public:
 	 **/	
 	void begin(HardwareSerial &bleSerial, Serial_ &serial, byte resetPin);
 	
-	
 	/**
 	 * Initialize the module for incoming connections
 	 */
@@ -65,6 +64,8 @@ protected:
 	 * Send an AT command and check for execution
 	 **/
 	bool executeCommand(char* PROGMEM command);
+	
+	void updateMode();
 	
 	void printHex(char X);
 	
